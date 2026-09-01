@@ -1,0 +1,5 @@
+string trajectory_id
+uint32 trajectory_revision
+---
+bool accepted
+string reason

@@ -1,0 +1,13 @@
+string trajectory_id
+uint32 trajectory_revision
+---
+bool success
+float64 final_position_error_m
+float64 final_angle_error_rad
+string failure_reason
+---
+string stage
+float64 position_error_m
+float64 angle_error_rad
+float32 progress
+bool tracking_valid

@@ -1,0 +1,15 @@
+builtin_interfaces/Time stamp
+string workflow_state
+string workflow_substate
+string active_trajectory_id
+uint32 active_trajectory_revision
+bool spine_tracking_valid
+bool tool_tracking_valid
+bool robot_tracking_valid
+geometry_msgs/Pose tool_pose_ct
+geometry_msgs/Pose guide_pose_ct
+float64 lateral_error_m
+float64 angular_error_rad
+float64 depth_error_m
+uint8 safety_state
+string[] alarms
