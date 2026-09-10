@@ -9,3 +9,5 @@ log/
 __pycache__/
 *.pyc
 .DS_Store
+results/
+src/external/
