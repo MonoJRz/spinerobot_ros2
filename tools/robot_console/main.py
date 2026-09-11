@@ -4,13 +4,13 @@ import json
 import math
 import os
 import shlex
+import signal
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-from PySide6.QtCore import QObject, QProcess, QThread, QTimer, Signal, Qt
+from PySide6.QtCore import QObject, QProcess, QTimer, Signal, Qt
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -29,6 +29,9 @@ from PySide6.QtWidgets import (
 try:
     import rclpy
     from rclpy.node import Node
+    from spinerobot_interfaces.msg import TrackingStatus
+    from geometry_msgs.msg import PointStamped
+    from rclpy.qos import qos_profile_sensor_data
     from xarm_msgs.msg import RobotMsg
     from xarm_msgs.srv import Call, SetInt16, SetInt16ById
     ROS_IMPORT_ERROR: Exception | None = None
@@ -44,6 +47,10 @@ except Exception as exc:
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[1]
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+from local_processes import discover, stop as stop_local_process
+
 CONFIG_PATH = Path(
     os.environ.get("BART_ROBOT_CONSOLE_CONFIG", str(HERE / "config.json"))
 ).expanduser()
@@ -160,102 +167,12 @@ class MarkerRow(QFrame):
             self.position.setText("XYZ  —")
             self.quality.setText("Quality  —")
 
-        if age_s is None:
+        if age_s is None or not math.isfinite(age_s):
             self.age.setText("Last seen  —")
         elif age_s < 1.0:
             self.age.setText(f"Last seen  {age_s * 1000.0:.0f} ms")
         else:
             self.age.setText(f"Last seen  {age_s:.1f} s")
-
-
-class NDIWorker(QThread):
-    tracker_state = Signal(bool, str)
-    marker_update = Signal(int, bool, object, object, object)
-    log = Signal(str)
-
-    def __init__(self, ndi_config: dict[str, Any], parent=None):
-        super().__init__(parent)
-        self.ndi_config = ndi_config
-
-    @staticmethod
-    def _safe_float(value: Any) -> float | None:
-        try:
-            array = np.asarray(value, dtype=float).reshape(-1)
-            if array.size == 0:
-                return None
-            result = float(array[0])
-            return result if math.isfinite(result) else None
-        except Exception:
-            return None
-
-    def run(self) -> None:
-        tracker = None
-        try:
-            from sksurgerynditracker.nditracker import NDITracker
-
-            marker_cfg = self.ndi_config["markers"]
-            rom_files = [str(resolve_repo_path(item["rom"])) for item in marker_cfg]
-            missing = [path for path in rom_files if not Path(path).is_file()]
-            if missing:
-                raise FileNotFoundError("Missing NDI ROM file(s): " + ", ".join(missing))
-
-            settings = {
-                "tracker type": "polaris",
-                "serial port": self.ndi_config.get("serial_port", "/dev/ttyUSB0"),
-                "romfiles": rom_files,
-            }
-
-            self.log.emit(f"Opening Polaris on {settings['serial port']}")
-            tracker = NDITracker(settings)
-            tracker.start_tracking()
-            self.tracker_state.emit(True, "Tracking")
-            self.log.emit("NDI Polaris tracking started")
-
-            poll_s = float(self.ndi_config.get("poll_period_s", 0.05))
-            last_seen: list[float | None] = [None] * len(marker_cfg)
-
-            while not self.isInterruptionRequested():
-                _, _, _, tracking, quality = tracker.get_frame()
-                now = time.monotonic()
-
-                for index in range(len(marker_cfg)):
-                    visible = False
-                    position = None
-                    q = None
-
-                    if index < len(tracking):
-                        matrix = np.asarray(tracking[index], dtype=float)
-                        visible = matrix.shape == (4, 4) and bool(np.isfinite(matrix).all())
-                        if visible:
-                            last_seen[index] = now
-                            position = (
-                                float(matrix[0, 3]),
-                                float(matrix[1, 3]),
-                                float(matrix[2, 3]),
-                            )
-                            if index < len(quality):
-                                q = self._safe_float(quality[index])
-
-                    age = None if last_seen[index] is None else max(0.0, now - last_seen[index])
-                    self.marker_update.emit(index, visible, q, position, age)
-
-                time.sleep(max(0.01, poll_s))
-
-        except Exception as exc:
-            self.log.emit(f"NDI error: {exc}")
-            self.tracker_state.emit(False, str(exc))
-        finally:
-            if tracker is not None:
-                try:
-                    tracker.stop_tracking()
-                except Exception:
-                    pass
-                try:
-                    tracker.close()
-                except Exception:
-                    pass
-            self.tracker_state.emit(False, "Stopped")
-            self.log.emit("NDI Polaris tracking stopped")
 
 
 if ROS_IMPORT_ERROR is None:
@@ -267,6 +184,16 @@ if ROS_IMPORT_ERROR is None:
             self.create_subscription(
                 RobotMsg, f"{namespace}/robot_states", bridge._on_robot_state, 10
             )
+            self.create_subscription(
+                TrackingStatus, "/tracking/status", bridge._on_tracking_status,
+                qos_profile_sensor_data,
+            )
+            for frame in bridge._marker_frames:
+                self.create_subscription(
+                    PointStamped, f"/tracking/{frame}/position",
+                    lambda msg, frame=frame: bridge._on_tracking_position(frame, msg),
+                    qos_profile_sensor_data,
+                )
             self.motion_enable = self.create_client(SetInt16ById, f"{namespace}/motion_enable")
             self.clean_error = self.create_client(Call, f"{namespace}/clean_error")
             self.clean_warn = self.create_client(Call, f"{namespace}/clean_warn")
@@ -274,17 +201,25 @@ if ROS_IMPORT_ERROR is None:
 
 
 class RosBridge(QObject):
+    ndi_connection_changed = Signal(bool)
+    marker_update = Signal(int, bool, object, object, object)
     robot_connection_changed = Signal(bool)
     robot_state_changed = Signal(object)
     service_result = Signal(str, bool, str)
     log = Signal(str)
 
-    def __init__(self, xarm_config: dict[str, Any], parent=None):
+    def __init__(self, xarm_config: dict[str, Any], ndi_config: dict[str, Any], parent=None):
         super().__init__(parent)
         self.node = None
         self._owns_rclpy = False
         self._last_state_time = 0.0
         self._connected = False
+        self._marker_frames = [item["frame_id"] for item in ndi_config["markers"]]
+        self._marker_times = {}
+        self._positions = {}
+        self._last_tracking_time = None
+        self.ndi_connected = False
+        self._heartbeat_timeout = float(ndi_config.get("heartbeat_timeout_s", 1.0))
         self._dof = int(xarm_config.get("dof", 6))
 
         if ROS_IMPORT_ERROR is not None:
@@ -297,7 +232,7 @@ class RosBridge(QObject):
         else:
             try:
                 if not rclpy.ok():
-                    rclpy.init(args=None)
+                    rclpy.init(args=None, domain_id=42)
                     self._owns_rclpy = True
                 self.node = XArmNode(self, xarm_config.get("namespace", "/xarm"))
             except Exception as exc:
@@ -317,7 +252,9 @@ class RosBridge(QObject):
         if self.node is None or rclpy is None or not rclpy.ok():
             return
         try:
-            rclpy.spin_once(self.node, timeout_sec=0.0)
+            # Drain enough callbacks for status plus positions at the tracker rate.
+            for _ in range(10):
+                rclpy.spin_once(self.node, timeout_sec=0.0)
         except Exception as exc:
             self.log.emit(f"ROS spin error: {exc}")
 
@@ -340,9 +277,38 @@ class RosBridge(QObject):
         )
 
     def _check_connection(self) -> None:
+        now = time.monotonic()
+        if self.ndi_connected and now - self._last_tracking_time > self._heartbeat_timeout:
+            self.ndi_connected = False
+            self.ndi_connection_changed.emit(False)
+        for index, seen in list(self._marker_times.items()):
+            if now - seen > self._heartbeat_timeout:
+                self.marker_update.emit(index, False, None, None, None)
+                del self._marker_times[index]
         if self._connected and time.monotonic() - self._last_state_time > 1.0:
             self._connected = False
             self.robot_connection_changed.emit(False)
+
+    def _on_tracking_position(self, frame, msg) -> None:
+        self._positions[frame] = (time.monotonic(), (
+            msg.point.x * 1000, msg.point.y * 1000, msg.point.z * 1000,
+        ))
+
+    def _on_tracking_status(self, msg) -> None:
+        now = time.monotonic()
+        self._last_tracking_time = now
+        if not self.ndi_connected:
+            self.ndi_connected = True
+            self.ndi_connection_changed.emit(True)
+        if msg.frame_id not in self._marker_frames:
+            return
+        index = self._marker_frames.index(msg.frame_id)
+        self._marker_times[index] = now
+        position_time, position = self._positions.get(msg.frame_id, (0, None))
+        if now - position_time > self._heartbeat_timeout:
+            position = None
+        self.marker_update.emit(index, bool(msg.visible and msg.valid),
+                                msg.quality, position, msg.age_sec)
 
     def _call(self, client, request, label: str) -> None:
         if self.node is None:
@@ -415,7 +381,6 @@ class RobotConsole(QMainWindow):
         self.config = load_config()
         self.xarm_cfg = self.config["xarm"]
         self.ndi_cfg = self.config["ndi"]
-        self.ndi_worker: NDIWorker | None = None
 
         self.setWindowTitle("BART Robot Console")
         self.resize(1180, 760)
@@ -428,7 +393,16 @@ class RobotConsole(QMainWindow):
         self.xarm_process.started.connect(self._xarm_process_started)
         self.xarm_process.finished.connect(self._xarm_process_finished)
 
-        self.ros = RosBridge(self.xarm_cfg, parent=self)
+        self.ndi_process = QProcess(self)
+        self.ndi_process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self.ndi_process.readyReadStandardOutput.connect(self._read_ndi_output)
+        self.ndi_process.finished.connect(self._ndi_finished)
+        self.ndi_process.errorOccurred.connect(
+            lambda _error: self.log(f"NDI process error: {self.ndi_process.errorString()}")
+        )
+        self.ros = RosBridge(self.xarm_cfg, self.ndi_cfg, parent=self)
+        self.ros.ndi_connection_changed.connect(self._on_ndi_connection)
+        self.ros.marker_update.connect(self._on_marker_update)
         self.ros.robot_connection_changed.connect(self._on_robot_connection)
         self.ros.robot_state_changed.connect(self._on_robot_state)
         self.ros.service_result.connect(self._on_service_result)
@@ -594,13 +568,17 @@ class RobotConsole(QMainWindow):
         if self.xarm_process.state() != QProcess.ProcessState.NotRunning:
             self.log("xArm driver is already running from this console")
             return
+        if discover("xarm", REPO_ROOT):
+            self.xarm_process_badge.set_status("LOCAL", "info")
+            self.log("xArm driver already running locally; Stop can control it")
+            return
         if self.xarm_robot_badge.text() == "ONLINE":
-            self.log("xArm robot_states is already online; refusing duplicate driver")
+            self.log("xArm robot_states is online; no matching local driver found")
             return
 
         ip = str(self.xarm_cfg.get("robot_ip", "192.168.1.231"))
         install_setup = REPO_ROOT / "install" / "setup.bash"
-        pieces = ["source /opt/ros/jazzy/setup.bash"]
+        pieces = ["export ROS_DOMAIN_ID=42", "source /opt/ros/jazzy/setup.bash"]
         if install_setup.is_file():
             pieces.append(f"source {shlex.quote(str(install_setup))}")
         pieces.append(
@@ -612,15 +590,28 @@ class RobotConsole(QMainWindow):
         self.xarm_process.setArguments(["-lc", " && ".join(pieces)])
         self.xarm_process.start()
 
+    def _stop_driver(self, kind: str, process: QProcess) -> None:
+        local = discover(kind, REPO_ROOT)
+        if local:
+            for driver in local:
+                try:
+                    if stop_local_process(driver, kind, REPO_ROOT):
+                        self.log(f"Stopping local {kind} driver (PID {driver.pid})")
+                except OSError as exc:
+                    self.log(f"Cannot stop {kind} PID {driver.pid}: {exc}")
+        if process.state() != QProcess.ProcessState.NotRunning:
+            # SIGINT lets ros2 launch shut down its children rather than orphaning them.
+            try:
+                os.kill(process.processId(), signal.SIGINT)
+            except ProcessLookupError:
+                pass
+            if not process.waitForFinished(5000):
+                self.log(f"{kind} is still shutting down; waiting for graceful exit")
+        elif not local:
+            self.log(f"No local {kind} driver on domain 42 found")
+
     def stop_xarm(self) -> None:
-        if self.xarm_process.state() == QProcess.ProcessState.NotRunning:
-            if self.xarm_robot_badge.text() == "ONLINE":
-                self.log("xArm is external; this console will not kill an external driver")
-            return
-        self.log("Stopping xArm driver started by this console")
-        self.xarm_process.terminate()
-        if not self.xarm_process.waitForFinished(2000):
-            self.xarm_process.kill()
+        self._stop_driver("xarm", self.xarm_process)
 
     def _xarm_process_started(self) -> None:
         self.xarm_process_badge.set_status("RUNNING", "info")
@@ -629,7 +620,7 @@ class RobotConsole(QMainWindow):
     def _xarm_process_finished(self, exit_code: int, _status) -> None:
         if self.xarm_robot_badge.text() == "ONLINE":
             self.xarm_process_badge.set_status(
-                "EXTERNAL",
+                "LOCAL" if discover("xarm", REPO_ROOT) else "REMOTE",
                 "info",
             )
         else:
@@ -658,7 +649,7 @@ class RobotConsole(QMainWindow):
                 == QProcess.ProcessState.NotRunning
             ):
                 self.xarm_process_badge.set_status(
-                    "EXTERNAL",
+                    "LOCAL" if discover("xarm", REPO_ROOT) else "REMOTE",
                     "info",
                 )
 
@@ -708,47 +699,59 @@ class RobotConsole(QMainWindow):
         self.ros.clear_warning()
 
     def start_ndi(self) -> None:
-        if self.ndi_worker is not None and self.ndi_worker.isRunning():
-            self.log("NDI tracking is already running")
+        if self.ndi_process.state() != QProcess.ProcessState.NotRunning:
+            self.log("NDI ROS node is already running from this console")
             return
-        self.ndi_worker = NDIWorker(self.ndi_cfg, parent=self)
-        self.ndi_worker.tracker_state.connect(self._on_ndi_state)
-        self.ndi_worker.marker_update.connect(self._on_marker_update)
-        self.ndi_worker.log.connect(self.log)
-        self.ndi_worker.finished.connect(self._ndi_finished)
+        if discover("ndi", REPO_ROOT):
+            self.log("NDI already running locally; Stop can control it")
+            return
+        if self.ros.ndi_connected:
+            self.log("NDI is online; no matching local node found")
+            return
+        if self.ros.node is None:
+            self.log("Cannot start NDI: ROS node unavailable. Build the interfaces and use run.sh.")
+            return
+        markers = self.ndi_cfg["markers"]
+        args = [str(REPO_ROOT / "launchers/start_ndi.sh")]
+        for key, value in {
+            "serial_port": self.ndi_cfg.get("serial_port", "/dev/ttyUSB0"),
+            "poll_period_s": self.ndi_cfg.get("poll_period_s", 0.05),
+            "rom_files": [str(resolve_repo_path(item["rom"])) for item in markers],
+            "frame_ids": [item["frame_id"] for item in markers],
+        }.items():
+            args.extend(["-p", f"{key}:={json.dumps(value)}"])
+        self.ndi_process.setProgram("/bin/bash")
+        self.ndi_process.setArguments(args)
         self.ndi_badge.set_status("STARTING", "info")
-        self.ndi_worker.start()
+        self.log("Starting NDI ROS node; waiting for /tracking/status")
+        self.ndi_process.start()
 
     def stop_ndi(self) -> None:
-        if self.ndi_worker is None or not self.ndi_worker.isRunning():
-            self.ndi_badge.set_status("STOPPED", "waiting")
-            return
-        self.log("Stopping NDI tracking")
-        self.ndi_worker.requestInterruption()
-        if not self.ndi_worker.wait(3000):
-            self.log("NDI worker is waiting for the current tracker call to return")
+        self._stop_driver("ndi", self.ndi_process)
 
-    def _on_ndi_state(self, running: bool, detail: str) -> None:
-        if running:
-            self.ndi_badge.set_status("TRACKING", "ready")
-            return
-
-        self._reset_ndi_markers()
-
-        if detail == "Stopped":
-            self.ndi_badge.set_status("STOPPED", "waiting")
-        else:
-            self.ndi_badge.set_status("ERROR", "error")
-            self.log(f"NDI state: {detail}")
+    def _on_ndi_connection(self, connected: bool) -> None:
+        self.ndi_badge.set_status("ONLINE" if connected else "NO HEARTBEAT",
+                                  "ready" if connected else "warning")
+        if not connected:
+            self._reset_ndi_markers()
+        self.log("NDI /tracking/status " + ("received" if connected else "timed out"))
 
     def _on_marker_update(self, index, visible, quality, position, age_s) -> None:
         if 0 <= index < len(self.marker_rows):
             self.marker_rows[index].set_marker(visible, quality, position, age_s)
 
-    def _ndi_finished(self) -> None:
-        self._reset_ndi_markers()
-        self.ndi_badge.set_status("STOPPED", "waiting")
-        self.ndi_worker = None
+    def _read_ndi_output(self) -> None:
+        data = bytes(self.ndi_process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        for line in data.splitlines():
+            if line.strip():
+                self.log(f"NDI | {line.strip()}")
+
+    def _ndi_finished(self, exit_code, _status) -> None:
+        self.log(f"NDI ROS process exited with code {exit_code}")
+        if not self.ros.ndi_connected:
+            self._reset_ndi_markers()
+            self.ndi_badge.set_status("STOPPED" if exit_code == 0 else "ERROR",
+                                      "waiting" if exit_code == 0 else "error")
 
     def start_all(self) -> None:
         self.start_xarm()
@@ -759,8 +762,10 @@ class RobotConsole(QMainWindow):
         self.stop_xarm()
 
     def closeEvent(self, event) -> None:
-        self.stop_ndi()
-        self.stop_xarm()
+        if self.ndi_process.state() != QProcess.ProcessState.NotRunning:
+            self.stop_ndi()
+        if self.xarm_process.state() != QProcess.ProcessState.NotRunning:
+            self.stop_xarm()
         self.ros.shutdown()
         super().closeEvent(event)
 

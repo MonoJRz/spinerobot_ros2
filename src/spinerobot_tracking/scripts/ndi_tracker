@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""Own the Polaris device and publish status for every marker on every frame."""
+import math
+import signal
+import time
+from pathlib import Path
+
+import numpy as np
+import rclpy
+from rclpy.node import Node
+from rclpy.signals import SignalHandlerOptions
+from geometry_msgs.msg import PointStamped
+from spinerobot_interfaces.msg import TrackingStatus
+from sksurgerynditracker.nditracker import NDITracker
+
+
+class TrackingNode(Node):
+    def __init__(self):
+        super().__init__("ndi_tracker")
+        self.tracker = None
+        self.declare_parameter("serial_port", "/dev/ttyUSB0")
+        self.declare_parameter("rom_files", [""])
+        self.declare_parameter("frame_ids", ["tool_marker", "robot_marker", "patient_marker"])
+        self.declare_parameter("poll_period_s", 0.05)
+        roms = self.get_parameter("rom_files").value
+        self.frames = self.get_parameter("frame_ids").value
+        period = float(self.get_parameter("poll_period_s").value)
+        if len(roms) != len(self.frames) or not all(Path(p).is_file() for p in roms):
+            raise ValueError("Provide one existing ROM file per frame_id")
+        if len(set(self.frames)) != len(self.frames) or not all(self.frames):
+            raise ValueError("frame_ids must be unique and nonempty")
+        if not math.isfinite(period) or period <= 0:
+            raise ValueError("poll_period_s must be positive and finite")
+        self.status_pub = self.create_publisher(TrackingStatus, "/tracking/status", 10)
+        self.position_pubs = {
+            frame: self.create_publisher(PointStamped, f"/tracking/{frame}/position", 10)
+            for frame in self.frames
+        }
+        self.last_seen = [None] * len(self.frames)
+        try:
+            self.tracker = NDITracker({
+                "tracker type": "polaris",
+                "serial port": self.get_parameter("serial_port").value,
+                "romfiles": roms,
+            })
+            self.tracker.start_tracking()
+            self.timer = self.create_timer(period, self.poll)
+        except BaseException:
+            self.close_tracker()
+            raise
+        self.get_logger().info("NDI started; heartbeat: /tracking/status")
+
+    def poll(self):
+        # A failed device read terminates the node, so stale data cannot masquerade
+        # as a healthy heartbeat. Occlusion, in contrast, publishes invisible status.
+        _, _, _, tracking, quality = self.tracker.get_frame()
+        now = time.monotonic()
+        stamp = self.get_clock().now().to_msg()
+        for i, frame in enumerate(self.frames):
+            matrix = np.asarray(tracking[i], dtype=float) if i < len(tracking) else np.array([])
+            visible = matrix.shape == (4, 4) and bool(np.isfinite(matrix).all())
+            q = float("nan")
+            if visible and i < len(quality):
+                values = np.asarray(quality[i], dtype=float).reshape(-1)
+                if values.size:
+                    q = float(values[0])
+            if visible:
+                self.last_seen[i] = now
+                point = PointStamped()
+                point.header.stamp = stamp
+                point.header.frame_id = "ndi_tracker"
+                point.point.x, point.point.y, point.point.z = (float(v) / 1000 for v in matrix[:3, 3])
+                self.position_pubs[frame].publish(point)
+            msg = TrackingStatus()
+            msg.frame_id = frame
+            msg.visible = visible
+            msg.valid = visible and math.isfinite(q) and q >= 0
+            msg.age_sec = float("inf") if self.last_seen[i] is None else now - self.last_seen[i]
+            msg.quality = q
+            msg.reason = "ok" if msg.valid else ("invalid_quality" if visible else "not_visible")
+            msg.stamp = stamp
+            self.status_pub.publish(msg)
+
+    def close_tracker(self):
+        if self.tracker is not None:
+            try:
+                # The backend closes tracking before releasing the serial device.
+                self.tracker.close()
+            finally:
+                self.tracker = None
+
+
+def main():
+    rclpy.init(domain_id=42, signal_handler_options=SignalHandlerOptions.NO)
+    stopping = False
+
+    def request_stop(_signum, _frame):
+        nonlocal stopping
+        # Finish the current serial transaction before sending TSTOP.
+        stopping = True
+
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+    node = None
+    try:
+        node = TrackingNode()
+        while rclpy.ok() and not stopping:
+            rclpy.spin_once(node, timeout_sec=0.1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            if node is not None:
+                node.close_tracker()
+        finally:
+            if node is not None:
+                node.destroy_node()
+            if rclpy.ok():
+                rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

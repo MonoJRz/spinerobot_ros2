@@ -8,9 +8,22 @@
     "serial_port": "/dev/ttyUSB0",
     "poll_period_s": 0.05,
     "markers": [
-      {"label": "Tool marker", "rom": "config/ndi_tools/8700338.rom"},
-      {"label": "Robot marker", "rom": "config/ndi_tools/8700339.rom"},
-      {"label": "Patient marker", "rom": "config/ndi_tools/8700340.rom"}
-    ]
+      {
+        "label": "Tool marker",
+        "rom": "config/ndi_tools/8700338.rom",
+        "frame_id": "tool_marker"
+      },
+      {
+        "label": "Robot marker",
+        "rom": "config/ndi_tools/8700339.rom",
+        "frame_id": "robot_marker"
+      },
+      {
+        "label": "Patient marker",
+        "rom": "config/ndi_tools/8700340.rom",
+        "frame_id": "patient_marker"
+      }
+    ],
+    "heartbeat_timeout_s": 1.0
   }
 }

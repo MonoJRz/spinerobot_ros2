@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 VENV="${HOME}/venvs/spinerobot_console"
 
+export ROS_DOMAIN_ID=42
 source /opt/ros/jazzy/setup.bash
 
 if [[ -f "${REPO_ROOT}/install/setup.bash" ]]; then

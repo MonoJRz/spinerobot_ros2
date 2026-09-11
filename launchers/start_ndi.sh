@@ -1,39 +1,13 @@
-#!/bin/bash
-
-PYTHON="$HOME/venvs/spinerobot_backend/bin/python"
-SCRIPT="$HOME/Workspace/spinerobot_ros2/test_vicra.py"
-
-echo "======================================"
-echo " BART LAB - Starting NDI Polaris Vicra"
-echo "======================================"
-echo
-echo "Python: $PYTHON"
-echo "Script: $SCRIPT"
-echo
-
-if [ ! -x "$PYTHON" ]; then
-    echo "ERROR: Backend Python environment not found:"
-    echo "$PYTHON"
-    read -p "Press Enter to close..."
-    exit 1
-fi
-
-"$PYTHON" -c \
-"from sksurgerynditracker.nditracker import NDITracker; print('NDITracker module OK')"
-
-if [ $? -ne 0 ]; then
-    echo
-    echo "ERROR: sksurgerynditracker is not installed in backend environment."
-    read -p "Press Enter to close..."
-    exit 1
-fi
-
-echo
-echo "Starting Polaris..."
-echo
-
-"$PYTHON" "$SCRIPT"
-
-echo
-echo "NDI process stopped."
-read -p "Press Enter to close..."
+#!/usr/bin/env bash
+set -eo pipefail
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+PYTHON="${NDI_PYTHON:-${HOME}/venvs/spinerobot_console/bin/python}"
+export ROS_DOMAIN_ID=42
+source /opt/ros/jazzy/setup.bash
+source "${REPO_ROOT}/install/setup.bash"
+# exec keeps the ROS node as the managed process and forwards stop signals.
+TRACKING_PREFIX="$(ros2 pkg prefix spinerobot_tracking)"
+exec "$PYTHON" "${TRACKING_PREFIX}/lib/spinerobot_tracking/ndi_tracker" --ros-args \
+    -p "rom_files:=['${REPO_ROOT}/config/ndi_tools/8700338.rom', '${REPO_ROOT}/config/ndi_tools/8700339.rom', '${REPO_ROOT}/config/ndi_tools/8700340.rom']" \
+    "$@"

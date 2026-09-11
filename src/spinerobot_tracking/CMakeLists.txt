@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.8)
+project(spinerobot_tracking)
+find_package(ament_cmake REQUIRED)
+install(PROGRAMS scripts/ndi_tracker DESTINATION lib/${PROJECT_NAME})
+ament_package()

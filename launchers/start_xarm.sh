@@ -1,5 +1,6 @@
 #!/bin/bash
 
+export ROS_DOMAIN_ID=42
 source /opt/ros/jazzy/setup.bash
 source "$HOME/Workspace/spinerobot_ros2/install/setup.bash"
 
