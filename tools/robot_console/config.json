@@ -1,0 +1,16 @@
+{
+  "xarm": {
+    "robot_ip": "192.168.1.231",
+    "namespace": "/xarm",
+    "dof": 6
+  },
+  "ndi": {
+    "serial_port": "/dev/ttyUSB0",
+    "poll_period_s": 0.05,
+    "markers": [
+      {"label": "Tool marker", "rom": "config/ndi_tools/8700338.rom"},
+      {"label": "Robot marker", "rom": "config/ndi_tools/8700339.rom"},
+      {"label": "Patient marker", "rom": "config/ndi_tools/8700340.rom"}
+    ]
+  }
+}
